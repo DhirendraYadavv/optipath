@@ -1,9 +1,14 @@
+from io import BytesIO
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse
 from neo4j import GraphDatabase
 from pydantic import BaseModel
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 app = FastAPI(title="OptiPath - SGT CDOE Career Gap Engine")
 
@@ -19,6 +24,7 @@ URI = "neo4j+s://1a8ea85a.databases.neo4j.io"
 AUTH = ("1a8ea85a", "UzFHMFFxC_nRMONZ2a55gCHB0CDWAx3jwosskGKVRA8")
 driver = GraphDatabase.driver(URI, auth=AUTH)
 
+# Extended Synthetic ERP Cohort
 MOCK_STUDENTS = {
     "SGT10023": {
         "name": "Aarav Sharma",
@@ -42,6 +48,18 @@ MOCK_STUDENTS = {
             "Code-OL130221",
         ],
     },
+    "SGT20011": {
+        "name": "Meera Joshi",
+        "program": "BCA",
+        "current_semester": 2,
+        "completed_courses": ["Code-OL130102"],
+    },
+}
+
+SALARY_BASELINES = {
+    "AI & Data Scientist": {"baseline": 4.5, "post_degree": 12.0},
+    "Full-Stack Developer": {"baseline": 3.8, "post_degree": 9.5},
+    "Cloud Architect": {"baseline": 5.0, "post_degree": 14.0},
 }
 
 
@@ -56,7 +74,7 @@ def student_lookup(roll_no: str):
     roll = roll_no.upper().strip()
     if roll not in MOCK_STUDENTS:
         raise HTTPException(
-            status_code=404, detail="Student not found in synthetic ERP."
+            status_code=404, detail="Student record not found in synthetic ERP."
         )
     return {"roll_no": roll, **MOCK_STUDENTS[roll]}
 
@@ -75,9 +93,7 @@ def compute_skill_gap(payload: GapAnalysisRequest):
         query, role=payload.target_role, completed=payload.completed_courses
     )
 
-    verified = []
-    partial = []
-    gap = []
+    verified, partial, gap = [], [], []
 
     for r in records:
         item = {
@@ -103,9 +119,23 @@ def compute_skill_gap(payload: GapAnalysisRequest):
         )
     )
 
+    salary_info = SALARY_BASELINES.get(
+        payload.target_role, {"baseline": 4.0, "post_degree": 10.0}
+    )
+    projected_salary = round(
+        salary_info["baseline"]
+        + (
+            (salary_info["post_degree"] - salary_info["baseline"])
+            * (readiness_pct / 100)
+        ),
+        1,
+    )
+
     return {
         "role": payload.target_role,
         "readiness_percentage": readiness_pct,
+        "projected_lpa": projected_salary,
+        "salary_range": salary_info,
         "total_required": total,
         "verified_skills": verified,
         "partial_skills": partial,
@@ -173,8 +203,7 @@ def get_market_drift(role: str = "AI & Data Scientist"):
 
     RETURN skills_2023,
            skills_2026,
-           [s IN skills_2026 WHERE NOT s IN skills_2023] AS emerging_skills,
-           [s IN skills_2023 WHERE NOT s IN skills_2026] AS obsolete_skills
+           [s IN skills_2026 WHERE NOT s IN skills_2023] AS emerging_skills
     """
     records, _, _ = driver.execute_query(query, role=role)
     if not records:
@@ -215,48 +244,127 @@ def get_market_drift(role: str = "AI & Data Scientist"):
     }
 
 
-@app.post("/resume/export", response_class=PlainTextResponse)
-def export_verified_resume(payload: GapAnalysisRequest):
-    res = compute_skill_gap(payload)
-    output = f"""========================================================================
-SGT CDOE - OPTIPATH ATS VERIFIED SKILLS PORTFOLIO
-Target Role: {res['role']}
-Curriculum Readiness Score: {res['readiness_percentage']}%
-========================================================================
+@app.post("/resume/export-pdf")
+def export_verified_resume_pdf(payload: GapAnalysisRequest):
+    gap_data = compute_skill_gap(payload)
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+    )
+    elements = []
+    styles = getSampleStyleSheet()
 
-1. ACADEMICALLY VERIFIED COMPETENCIES (Confidence >= 75%)
-------------------------------------------------------------------------
-"""
-    for v in res["verified_skills"]:
-        sources = (
-            ", ".join(v["sources"])
-            if v["sources"]
-            else "Curriculum-grounded coursework"
+    title_style = ParagraphStyle(
+        "TitleStyle",
+        parent=styles["Heading1"],
+        fontSize=18,
+        textColor=colors.HexColor("#0f172a"),
+        spaceAfter=4,
+    )
+    subtitle_style = ParagraphStyle(
+        "SubtitleStyle",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#475569"),
+        spaceAfter=14,
+    )
+    section_style = ParagraphStyle(
+        "SectionStyle",
+        parent=styles["Heading2"],
+        fontSize=12,
+        textColor=colors.HexColor("#1e293b"),
+        spaceBefore=12,
+        spaceAfter=6,
+    )
+    body_style = ParagraphStyle(
+        "BodyStyle",
+        parent=styles["Normal"],
+        fontSize=9,
+        textColor=colors.HexColor("#334155"),
+        spaceAfter=4,
+    )
+
+    elements.append(
+        Paragraph("SGT CDOE • OptiPath Verified Competency Report", title_style)
+    )
+    elements.append(
+        Paragraph(
+            f"Target Industry Role: <b>{gap_data['role']}</b> &nbsp;|&nbsp; Certified Market Readiness: <b>{gap_data['readiness_percentage']}%</b>",
+            subtitle_style,
         )
-        output += f"- {v['skill']} ({v['category']}) | Confidence: {int(v['confidence']*100)}%\n  Certified Course: {sources}\n"
+    )
+    elements.append(Spacer(1, 8))
 
-    if res["partial_skills"]:
-        output += """
-2. IN-PROGRESS / FOUNDATIONAL COMPETENCIES (Confidence < 75%)
-------------------------------------------------------------------------
-"""
-        for p in res["partial_skills"]:
-            output += f"- {p['skill']} ({p['category']}) | Confidence: {int(p['confidence']*100)}%\n"
+    elements.append(
+        Paragraph("1. Academically Verified Competencies", section_style)
+    )
+    table_data = [["Skill", "Domain", "Confidence", "Certified Coursework"]]
+    for item in gap_data["verified_skills"]:
+        sources = ", ".join(item["sources"]) if item["sources"] else "Core Syllabus Coursework"
+        table_data.append(
+            [
+                item["skill"],
+                item["category"],
+                f"{int(item['confidence']*100)}%",
+                sources,
+            ]
+        )
 
-    output += f"""
-3. IDENTIFIED CURRICULUM RESIDUAL GAPS
-------------------------------------------------------------------------
-"""
-    for g in res["skill_gaps"]:
-        output += f"- {g['skill']} ({g['category']}) [Scheduled in Future Semesters]\n"
+    t = Table(table_data, colWidths=[120, 90, 70, 240])
+    t.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0284c7")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ]
+        )
+    )
+    elements.append(t)
+    elements.append(Spacer(1, 14))
 
-    output += f"""
-========================================================================
-Verification Engine: SGT CDOE OptiPath Graph Traversal (Neo4j Aura)
-Integrity Hash: SGT-VERIFIED-{abs(hash(res['role'] + str(payload.completed_courses)))}
-========================================================================
-"""
-    return output
+    if gap_data["skill_gaps"]:
+        elements.append(
+            Paragraph("2. Outstanding Curriculum Gaps (Roadmapped)", section_style)
+        )
+        for g in gap_data["skill_gaps"]:
+            elements.append(
+                Paragraph(
+                    f"&bull; <b>{g['skill']}</b> ({g['category']}) &mdash; Scheduled for resolution in subsequent academic semesters.",
+                    body_style,
+                )
+            )
+
+    elements.append(Spacer(1, 20))
+    elements.append(
+        Paragraph(
+            f"<b>Integrity Hash:</b> SGT-AUTH-{abs(hash(gap_data['role'] + str(payload.completed_courses)))}<br/>"
+            "<i>Issued by SGT Center for Distance and Online Education &bull; OptiPath Career Graph Validation</i>",
+            body_style,
+        )
+    )
+
+    doc.build(elements)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=SGT_Verified_Profile_{gap_data['role'].replace(' ', '_')}.pdf"
+        },
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -267,11 +375,11 @@ def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OptiPath | SGT CDOE Career Engine</title>
+        <title>OptiPath | SGT CDOE Career Gap Engine</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
         <style>
-            #network-canvas { height: 440px; width: 100%; border-radius: 0.75rem; background-color: #070d1d; }
+            #network-canvas { height: 460px; width: 100%; border-radius: 0.75rem; background-color: #060b18; }
         </style>
     </head>
     <body class="bg-slate-950 text-slate-100 min-h-screen font-sans p-6">
@@ -280,9 +388,8 @@ def serve_dashboard():
             <header class="border-b border-slate-800 pb-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                 <div>
                     <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-sky-400 via-indigo-300 to-emerald-400">OptiPath</h1>
-                    <p class="text-sm text-slate-400">Curriculum-Grounded Career Gap Engine &bull; SGT CDOE</p>
+                    <p class="text-sm text-slate-400">Curriculum-Grounded Career Gap & Pathfinding Engine &bull; SGT CDOE</p>
                 </div>
-                <!-- Navigation Tabs -->
                 <div class="flex gap-2 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-semibold">
                     <button id="tabA" onclick="switchTab('A')" class="px-4 py-2 rounded-lg bg-sky-600 text-white transition">Flow A: Enrolled Student</button>
                     <button id="tabB" onclick="switchTab('B')" class="px-4 py-2 rounded-lg text-slate-400 hover:text-white transition">Flow B: Prospective Pivot</button>
@@ -315,20 +422,42 @@ def serve_dashboard():
                 </div>
                 <div class="flex gap-3">
                     <button onclick="runCurrentFlow()" class="bg-sky-600 hover:bg-sky-500 py-2.5 px-6 rounded-xl font-medium text-sm transition flex-1">Run Skill-Gap Analysis</button>
-                    <button onclick="downloadResume()" class="bg-emerald-600 hover:bg-emerald-500 py-2.5 px-6 rounded-xl font-medium text-sm transition">Export Verified ATS Resume (.txt)</button>
+                    <button onclick="downloadPdfResume()" class="bg-emerald-600 hover:bg-emerald-500 py-2.5 px-6 rounded-xl font-medium text-sm transition flex items-center justify-center gap-2">
+                        <span>Download Official ATS PDF</span>
+                    </button>
                 </div>
             </div>
 
-            <!-- Flow B: Prospective Pivot Controls -->
-            <div id="flowBControls" class="hidden bg-slate-900 border border-slate-800 p-5 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-4">
-                <div>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Prospective Student Mode</span>
-                    <h3 class="text-lg font-bold text-white">Career Gap Transformation</h3>
-                    <p class="text-xs text-slate-400">Toggle enrollment to simulate full curriculum career readiness.</p>
+            <!-- Flow B: Prospective Pivot Controls & Salary Projection -->
+            <div id="flowBControls" class="hidden space-y-4">
+                <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-4">
+                    <div>
+                        <span class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Prospective Student Mode</span>
+                        <h3 class="text-lg font-bold text-white">Degree Pivot & Salary Transformation</h3>
+                        <p class="text-xs text-slate-400">Simulate market employability before and after enrolling in SGT Online MCA.</p>
+                    </div>
+                    <div class="flex items-center gap-3 bg-slate-950 px-4 py-3 rounded-xl border border-slate-800">
+                        <label class="text-sm font-medium text-slate-300 cursor-pointer" for="pivotToggle">Enroll in SGT Online MCA</label>
+                        <input type="checkbox" id="pivotToggle" onchange="runCurrentFlow()" class="w-5 h-5 accent-emerald-500 cursor-pointer">
+                    </div>
                 </div>
-                <div class="flex items-center gap-3 bg-slate-950 px-4 py-3 rounded-xl border border-slate-800">
-                    <label class="text-sm font-medium text-slate-300 cursor-pointer" for="pivotToggle">Enroll in SGT Online MCA</label>
-                    <input type="checkbox" id="pivotToggle" onchange="runCurrentFlow()" class="w-5 h-5 accent-emerald-500 cursor-pointer">
+
+                <!-- Salary Slider ROI Box -->
+                <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                    <div>
+                        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 block">Projected Compensation (LPA)</span>
+                        <div class="text-3xl font-extrabold text-emerald-400 mt-1" id="salaryDisplay">&#8377; 4.5 LPA</div>
+                        <p class="text-xs text-slate-400 mt-1">Estimated annual package benchmarked against live entry vs. verified credential status.</p>
+                    </div>
+                    <div class="space-y-2">
+                        <div class="flex justify-between text-xs text-slate-400">
+                            <span>Unskilled Baseline: <b id="minSal">&#8377; 4.5L</b></span>
+                            <span>Target Degree Cap: <b id="maxSal">&#8377; 12.0L</b></span>
+                        </div>
+                        <div class="w-full bg-slate-950 h-3 rounded-full overflow-hidden border border-slate-800">
+                            <div id="salaryBar" class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 transition-all duration-500" style="width: 15%"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -345,9 +474,8 @@ def serve_dashboard():
                 <div id="driftOutput" class="space-y-2 pt-2"></div>
             </div>
 
-            <!-- DAG Canvas & Panels -->
+            <!-- Visuals: Hierarchical DAG & Timeline -->
             <div id="graphLayout" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <!-- Left-to-Right DAG Canvas -->
                 <div class="lg:col-span-2 bg-slate-900 border border-slate-800 p-4 rounded-2xl space-y-3">
                     <div class="flex justify-between items-center px-1">
                         <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-300">Hierarchical DAG (Courses &rarr; Skills &rarr; Role)</h2>
@@ -360,7 +488,6 @@ def serve_dashboard():
                     <div id="network-canvas"></div>
                 </div>
 
-                <!-- Score & Clean Timeline -->
                 <div class="space-y-4">
                     <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
                         <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Curriculum Market Readiness</span>
@@ -371,7 +498,7 @@ def serve_dashboard():
                     </div>
 
                     <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl space-y-3">
-                        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 block">Timeline-to-Close (Syllabus Resolution)</span>
+                        <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 block">Timeline-to-Close (Curriculum Traversal)</span>
                         <div id="timelineOutput" class="space-y-2 text-xs text-slate-300 max-h-64 overflow-y-auto"></div>
                     </div>
                 </div>
@@ -444,6 +571,14 @@ def serve_dashboard():
                     const gapData = await gapRes.json();
                     document.getElementById('readinessScore').innerText = `${gapData.readiness_percentage}%`;
 
+                    // Update Salary Visualization
+                    if (gapData.projected_lpa) {
+                        document.getElementById('salaryDisplay').innerHTML = `&#8377; ${gapData.projected_lpa} LPA`;
+                        document.getElementById('minSal').innerText = `₹ ${gapData.salary_range.baseline}L`;
+                        document.getElementById('maxSal').innerText = `₹ ${gapData.salary_range.post_degree}L`;
+                        document.getElementById('salaryBar').style.width = `${gapData.readiness_percentage}%`;
+                    }
+
                     const timeRes = await fetch('/graph/timeline', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -460,7 +595,7 @@ def serve_dashboard():
             function renderTimeline(stages) {
                 const out = document.getElementById('timelineOutput');
                 if (!stages || stages.length === 0) {
-                    out.innerHTML = '<div class="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-300">Target role competency achieved!</div>';
+                    out.innerHTML = '<div class="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-300">All role requirements resolved!</div>';
                     return;
                 }
                 out.innerHTML = stages.map(s => `
@@ -503,7 +638,7 @@ def serve_dashboard():
                     font: { color: '#ffffff', size: 14, bold: true }
                 });
 
-                // Layer 2 (Middle): Skills (Color-coded by confidence)
+                // Layer 2 (Middle): Skills
                 let sCounter = 0;
                 function addSkills(list, bg, border) {
                     list.forEach(item => {
@@ -516,11 +651,7 @@ def serve_dashboard():
                             color: { background: bg, border: border },
                             font: { color: '#ffffff', size: 11 }
                         });
-
-                        // Edge from Skill to Role
                         edges.push({ from: sId, to: 'TARGET_ROLE', color: { color: border }, arrows: 'to' });
-
-                        // If verified, connect from completed course
                         if (item.confidence > 0 && completed.length > 0) {
                             edges.push({ from: 'C_0', to: sId, color: { color: '#38bdf8' }, arrows: 'to', dashes: true });
                         }
@@ -573,10 +704,10 @@ def serve_dashboard():
                 }
             }
 
-            async function downloadResume() {
+            async function downloadPdfResume() {
                 const role = document.getElementById('roleSelect').value;
                 const completed = getActiveCompletedCourses();
-                const res = await fetch('/resume/export', {
+                const res = await fetch('/resume/export-pdf', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ target_role: role, completed_courses: completed })
@@ -585,7 +716,7 @@ def serve_dashboard():
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `SGT_Verified_Resume_${role.replace(/\\s+/g, '_')}.txt`;
+                a.download = `SGT_Verified_Profile_${role.replace(/\\s+/g, '_')}.pdf`;
                 a.click();
             }
 
